@@ -1,6 +1,6 @@
 [app]
 app_url = "http://127.0.0.1:8000"
-app_key = "grok2api"
+app_key = "sk-123456"
 api_key = ""
 public_enabled = true
 public_key = ""
