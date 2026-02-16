@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Union
 import base64
 import binascii
 import time
+import uuid
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -497,6 +498,34 @@ def validate_request(request: ChatCompletionRequest):
         request.video_config = config
 
 
+def _chat_chunk_json(
+    chat_id: str,
+    created: int,
+    model: str,
+    *,
+    delta: dict,
+    finish_reason: Optional[str] = None,
+) -> str:
+    """Build a single chat.completion.chunk JSON string."""
+    import orjson
+    chunk = {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "system_fingerprint": "",
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "logprobs": None,
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    return orjson.dumps(chunk).decode()
+
+
 router = APIRouter(tags=["Chat"])
 
 
@@ -555,27 +584,67 @@ async def chat_completions(request: ChatCompletionRequest):
             prompt=prompt,
             images=[image_url],
             n=n,
-            response_format=response_format,
-            stream=bool(is_stream),
+            response_format="url",
+            stream=False,
         )
 
-        if result.stream:
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        now = int(time.time())
+        edit_urls = result.data if isinstance(result.data, list) else []
+
+        lines = [f"I edited images with the prompt: '{prompt}'"]
+        for img_url in edit_urls:
+            img_id = uuid.uuid4().hex[:8]
+            lines.append(f"![{img_id}]({img_url})")
+        content = "\n".join(lines) + "\n"
+
+        if is_stream:
+            async def _edit_chat_stream():
+                yield f"data: {_chat_chunk_json(chat_id, now, request.model, delta={'role': 'assistant', 'content': ''})}\n\n"
+                yield f"data: {_chat_chunk_json(chat_id, now, request.model, delta={'content': content})}\n\n"
+                yield f"data: {_chat_chunk_json(chat_id, now, request.model, delta={}, finish_reason='stop')}\n\n"
+                yield "data: [DONE]\n\n"
+
             return StreamingResponse(
-                result.data,
+                _edit_chat_stream(),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
 
-        data = [{response_field: img} for img in result.data]
         return JSONResponse(
             content={
-                "created": int(time.time()),
-                "data": data,
+                "id": chat_id,
+                "object": "chat.completion",
+                "created": now,
+                "model": request.model,
+                "system_fingerprint": "",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": content,
+                            "refusal": None,
+                            "annotations": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
                 "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
                     "total_tokens": 0,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
+                    "prompt_tokens_details": {
+                        "cached_tokens": 0,
+                        "text_tokens": 0,
+                        "audio_tokens": 0,
+                        "image_tokens": 0,
+                    },
+                    "completion_tokens_details": {
+                        "text_tokens": 0,
+                        "audio_tokens": 0,
+                        "reasoning_tokens": 0,
+                    },
                 },
             }
         )
@@ -618,37 +687,82 @@ async def chat_completions(request: ChatCompletionRequest):
                 status_code=429,
             )
 
+        # Always use url format + non-stream internally for chat completions,
+        # then wrap results into standard chat completion format.
         result = await ImageGenerationService().generate(
             token_mgr=token_mgr,
             token=token,
             model_info=model_info,
             prompt=prompt,
             n=n,
-            response_format=response_format,
+            response_format="url",
             size=size,
             aspect_ratio=aspect_ratio,
-            stream=bool(is_stream),
+            stream=False,
         )
 
-        if result.stream:
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        now = int(time.time())
+        image_urls = result.data if isinstance(result.data, list) else []
+
+        # Build markdown content with image URLs
+        lines = [f"I generated images with the prompt: '{prompt}'"]
+        for img_url in image_urls:
+            img_id = uuid.uuid4().hex[:8]
+            lines.append(f"![{img_id}]({img_url})")
+        content = "\n".join(lines) + "\n"
+
+        if is_stream:
+            async def _image_chat_stream():
+                # First chunk: role
+                yield f"data: {_chat_chunk_json(chat_id, now, request.model, delta={'role': 'assistant', 'content': ''})}\n\n"
+                # Content chunk
+                yield f"data: {_chat_chunk_json(chat_id, now, request.model, delta={'content': content})}\n\n"
+                # Finish chunk
+                yield f"data: {_chat_chunk_json(chat_id, now, request.model, delta={}, finish_reason='stop')}\n\n"
+                yield "data: [DONE]\n\n"
+
             return StreamingResponse(
-                result.data,
+                _image_chat_stream(),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
 
-        data = [{response_field: img} for img in result.data]
-        usage = result.usage_override or {
-            "total_tokens": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
-        }
         return JSONResponse(
             content={
-                "created": int(time.time()),
-                "data": data,
-                "usage": usage,
+                "id": chat_id,
+                "object": "chat.completion",
+                "created": now,
+                "model": request.model,
+                "system_fingerprint": "",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": content,
+                            "refusal": None,
+                            "annotations": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 0,
+                        "text_tokens": 0,
+                        "audio_tokens": 0,
+                        "image_tokens": 0,
+                    },
+                    "completion_tokens_details": {
+                        "text_tokens": 0,
+                        "audio_tokens": 0,
+                        "reasoning_tokens": 0,
+                    },
+                },
             }
         )
 
